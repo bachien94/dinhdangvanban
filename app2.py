@@ -1,5 +1,6 @@
 import streamlit as st
 from docx import Document
+from docx.table import Table
 from docx.shared import Cm, RGBColor, Pt
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -14,6 +15,26 @@ st.set_page_config(
 
 st.title("📄 Công Cụ Xử Lý Tệp Word (.docx)")
 st.markdown("Tải tệp lên ở bên trái và tùy chỉnh nhanh ở bên phải.")
+
+# Hàm quét triệt để 100% mọi ngóc ngách không bị sót bảng
+def get_all_tables_absolute(document):
+    tables_list = []
+    seen_ids = set()
+    
+    def walk_xml(element):
+        for child in element:
+            if child.tag.endswith('tbl'):
+                tbl_id = id(child)
+                if tbl_id not in seen_ids:
+                    seen_ids.add(tbl_id)
+                    try:
+                        tables_list.append(Table(child, document))
+                    except Exception:
+                        pass
+            walk_xml(child)
+
+    walk_xml(document._element)
+    return tables_list
 
 # Chia 2 cột ngang
 col_left, col_right = st.columns(2, gap="large")
@@ -69,11 +90,14 @@ with col_right:
             line_spacing = st.selectbox("Giãn dòng", [1.0, 1.15, 1.5, 2.0], index=1)
             space_after = st.number_input("Khoảng cách sau đoạn (pt)", min_value=0.0, max_value=30.0, value=6.0, step=1.0)
 
-    # 4. Tùy chọn Autofit chuẩn của Word
-    autofit_tables = st.checkbox("Tự động co giãn bảng (Autofit chuẩn Word)", value=True, disabled=not is_enabled)
+    # 4. Tùy chọn Autofit (để mặc định là False)
+    autofit_tables = st.checkbox("Tự động co giãn bảng (Autofit chuẩn Word)", value=False, disabled=not is_enabled)
 
 # Xử lý tệp khi người dùng đã upload
 if uploaded_file is not None and doc is not None:
+    # Gom toàn bộ bảng từ gốc XML tuyệt đối
+    all_tables = get_all_tables_absolute(doc)
+
     if custom_margin:
         for section in doc.sections:
             section.top_margin = Cm(top_margin)
@@ -82,6 +106,7 @@ if uploaded_file is not None and doc is not None:
             section.right_margin = Cm(right_margin)
     
     if remove_background:
+        # Xử lý đoạn văn bản thường
         for paragraph in doc.paragraphs:
             for run in paragraph.runs:
                 run.font.color.rgb = RGBColor(0, 0, 0)
@@ -90,14 +115,32 @@ if uploaded_file is not None and doc is not None:
                 if highlight is not None:
                     rPr.remove(highlight)
         
-        for table in doc.tables:
+        # Xử lý toàn bộ bảng (nền, màu chữ, và đường kẻ viền)
+        for table in all_tables:
+            tblPr = table._tbl.tblPr
+            
+            # Chuyển màu đường kẻ bảng chung về đen
+            tblBorders = tblPr.find(qn('w:tblBorders'))
+            if tblBorders is not None:
+                for border in tblBorders:
+                    border.set(qn('w:color'), '000000')
+            
             for row in table.rows:
                 for cell in row.cells:
                     tcPr = cell._tc.get_or_add_tcPr()
+                    
+                    # Xóa màu nền ô
                     shd = tcPr.find('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}shd')
                     if shd is not None:
                         tcPr.remove(shd)
                     
+                    # Chuyển màu đường kẻ riêng của từng ô về đen (nếu có)
+                    tcBorders = tcPr.find(qn('w:tcBorders'))
+                    if tcBorders is not None:
+                        for border in tcBorders:
+                            border.set(qn('w:color'), '000000')
+                    
+                    # Đưa chữ trong ô về màu đen và xóa highlight
                     for paragraph in cell.paragraphs:
                         for run in paragraph.runs:
                             run.font.color.rgb = RGBColor(0, 0, 0)
@@ -117,38 +160,39 @@ if uploaded_file is not None and doc is not None:
         for paragraph in doc.paragraphs:
             format_paragraph(paragraph)
             
-        for table in doc.tables:
+        for table in all_tables:
             for row in table.rows:
                 for cell in row.cells:
                     for paragraph in cell.paragraphs:
                         format_paragraph(paragraph)
 
-    # Áp dụng Autofit chuẩn của Word
+    # Áp dụng Autofit tối ưu cho tất cả các bảng
     if autofit_tables:
-        for table in doc.tables:
+        for table in all_tables:
             table.autofit = True
             tblPr = table._tbl.tblPr
             
-            # Kích hoạt chế độ autofit layout trong XML của Word
             tblLayout = tblPr.find(qn('w:tblLayout'))
             if tblLayout is None:
                 tblLayout = OxmlElement('w:tblLayout')
                 tblPr.append(tblLayout)
             tblLayout.set(qn('w:type'), 'autofit')
             
-            # Đặt kiểu bảng về dạng tự động mở rộng theo nội dung
             tblW = tblPr.find(qn('w:tblW'))
             if tblW is not None:
                 tblW.set(qn('w:type'), 'auto')
                 tblW.set(qn('w:w'), '0')
                 
-            # Xóa bỏ độ rộng ép buộc ở từng ô để cơ chế Autofit của Word tự tính toán
             for row in table.rows:
                 for cell in row.cells:
                     tcPr = cell._tc.get_or_add_tcPr()
                     tcW = tcPr.find(qn('w:tcW'))
                     if tcW is not None:
                         tcPr.remove(tcW)
+            
+            tblGrid = table._tbl.find(qn('w:tblGrid'))
+            if tblGrid is not None:
+                table._tbl.remove(tblGrid)
 
     bio = io.BytesIO()
     doc.save(bio)
